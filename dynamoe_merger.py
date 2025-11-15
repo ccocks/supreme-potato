@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-DynamoE Merger - Multi-worker model merger with safe 2% jitter
-Optimized for low RAM/disk environments (GitHub Actions)
+DynamoE Merger - TRUE PARALLEL WORKER VERSION
+No global lock - workers claim individual files via state file
+Optimized for GitHub Actions with limited RAM/disk
 """
 
 import os
@@ -18,7 +19,7 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from functools import wraps
 
-# Minimal imports (install with pip)
+# Minimal imports
 try:
     import torch
     from safetensors import safe_open
@@ -27,33 +28,22 @@ try:
     from huggingface_hub.utils import HfHubHTTPError
 except ImportError as e:
     print(f"Missing dependency: {e}")
-    print("Install with: pip install torch safetensors huggingface_hub")
     sys.exit(1)
 
 # ============ CONFIG ============
-LOCK_FILE = "dynamoe_merger.lock"
 STATE_FILE = "dynamoe_merger.state.json"
 LOG_FILE = "dynamoe_merger.log"
 
-LOCK_TTL_HOURS = 2  # Shorter for GitHub Actions
-MAX_RETRIES = 3  # Less retries for faster failure
+MAX_RETRIES = 3
 BACKOFF_BASE_SEC = 5
-
-ESSENTIAL_SUFFIXES = (".safetensors", ".py", ".bin", ".json", ".model", ".config")
-SAFE_SKIP_PATTERNS = (
-    "embed", "embedding", "word_embeddings", "lm_head", "final_logits_bias",
-    "layernorm", "rms_norm", "norm.", ".ln", "rope", "rotary", "rotary_emb",
-    "inv_freq", "alibi", "position", "router", "route", "gate", "gating",
-    "expert_score", "topk", "switch", "dispatch", "bias"
-)
 
 # GitHub Actions constraints
 JITTER_PCT = 0.02
-JITTER_MAX_GB = 2.0  # Skip jitter for files > 2GB (Actions has 7GB RAM)
-CHUNK_ELEMS = 1_000_000  # Smaller chunks for memory
-DEFAULT_BATCH_MAX_GB = 5.0  # Small batches (Actions has 14GB disk)
+JITTER_MAX_GB = 2.0  # Skip jitter for files > 2GB
+CHUNK_ELEMS = 1_000_000
+DEFAULT_BATCH_MAX_GB = 3.0  # Small batches for Actions
 
-# ============ SETUP LOGGING ============
+# ============ LOGGING ============
 def setup_logging(verbose=False):
     logger = logging.getLogger("DynamoE")
     logger.setLevel(logging.DEBUG if verbose else logging.INFO)
@@ -64,16 +54,14 @@ def setup_logging(verbose=False):
 
 logger = setup_logging()
 
-# ============ UTILITIES ============
 def get_disk_usage():
     """Get available disk space in GB"""
     stat = shutil.disk_usage("/")
     return stat.free / (1024**3)
 
 def cleanup_temp():
-    """Aggressive temp cleanup for Actions"""
-    temp_dirs = ["/tmp", tempfile.gettempdir()]
-    for temp_dir in temp_dirs:
+    """Aggressive cleanup for Actions"""
+    for temp_dir in ["/tmp", tempfile.gettempdir()]:
         try:
             for item in Path(temp_dir).iterdir():
                 if item.is_dir() and item.name.startswith("tmp"):
@@ -97,50 +85,14 @@ def backoff(fn):
 
 # ============ MERGER CLASS ============
 class DynamoEMerger:
-    def __init__(self, target_repo, hf_token):
+    def __init__(self, target_repo, hf_token, worker_id=1, total_workers=1):
         self.target_repo = target_repo
         self.api = HfApi(token=hf_token)
-        self.worker_id = f"worker_{os.environ.get('GITHUB_RUN_ID', 'local')}_{os.getpid()}"
+        self.worker_id = int(worker_id)
+        self.total_workers = int(total_workers)
         self.api.create_repo(repo_id=self.target_repo, exist_ok=True, repo_type="model")
-        logger.info(f"Initialized {self.worker_id} for {self.target_repo}")
+        logger.info(f"Initialized worker {self.worker_id}/{self.total_workers} for {self.target_repo}")
         logger.info(f"Available disk: {get_disk_usage():.1f}GB")
-
-    @backoff
-    def acquire_lock(self, force_reclaim_after_hours=LOCK_TTL_HOURS):
-        now = datetime.utcnow()
-        try:
-            p = hf_hub_download(repo_id=self.target_repo, filename=LOCK_FILE, repo_type="model")
-            with open(p) as f:
-                holder = json.load(f)
-            ts = datetime.fromisoformat(holder["ts"])
-            age = now - ts
-            if age < timedelta(hours=force_reclaim_after_hours):
-                raise RuntimeError(f"Lock held by {holder['id']} (age {age})")
-            logger.info(f"Reclaiming stale lock (age {age})")
-            self.api.delete_file(LOCK_FILE, self.target_repo, repo_type="model")
-        except HfHubHTTPError as e:
-            if e.response.status_code != 404:
-                raise
-        except FileNotFoundError:
-            pass
-        
-        payload = {"id": self.worker_id, "ts": now.isoformat()}
-        self.api.upload_file(
-            path_or_fileobj=json.dumps(payload).encode(),
-            path_in_repo=LOCK_FILE,
-            repo_id=self.target_repo,
-            repo_type="model",
-            commit_message=f"lock by {self.worker_id}"
-        )
-        logger.info("Lock acquired")
-
-    @backoff
-    def release_lock(self):
-        try:
-            self.api.delete_file(LOCK_FILE, self.target_repo, repo_type="model")
-            logger.info("Lock released")
-        except HfHubHTTPError:
-            pass
 
     @backoff
     def read_state(self):
@@ -161,29 +113,40 @@ class DynamoEMerger:
         finally:
             os.remove(tmpname)
 
+    def claim_files(self, plan, state):
+        """Claim unassigned files for this worker"""
+        claimed = []
+        for repo, fname, tgt, jitter in plan:
+            file_state = state["files"].get(tgt, {})
+            if file_state.get("status") == "done":
+                continue  # Already done
+            if file_state.get("assigned_to") is None:
+                # File is free - claim it
+                state["files"][tgt] = {
+                    "status": "pending",
+                    "assigned_to": self.worker_id,
+                    "src": f"{repo}/{fname}",
+                    "jitter": jitter
+                }
+                claimed.append((repo, fname, tgt, jitter))
+        return claimed
+
     def build_plan(self, models):
-        """Build processing plan"""
+        """Build deterministic plan"""
         plan = []
         total_shards = 0
         shard_idx = 1
         
-        for expert_idx, model_config in enumerate(models):
+        # Count shards first
+        for model_config in models:
             repo = list(model_config.keys())[0]
-            jitter = list(model_config.values())[0]
-            expert_dir = f"experts/expert_{expert_idx:03d}"
-            
             try:
                 files = sorted(self.api.list_repo_files(repo, repo_type="model"))
-                for fname in files:
-                    if fname.endswith(".metal") or fname.startswith("."):
-                        continue
-                    if fname.endswith(".safetensors"):
-                        total_shards += 1
-            except Exception as e:
-                logger.error(f"Cannot scan {repo}: {e}")
+                total_shards += sum(1 for f in files if f.endswith(".safetensors"))
+            except:
+                pass
         
-        # Second pass with correct total
-        shard_idx = 1
+        # Build plan
         for expert_idx, model_config in enumerate(models):
             repo = list(model_config.keys())[0]
             jitter = list(model_config.values())[0]
@@ -197,10 +160,8 @@ class DynamoEMerger:
                     if fname.endswith(".safetensors"):
                         tgt = f"model-{shard_idx:05d}-of-{total_shards:05d}.safetensors"
                         shard_idx += 1
-                    elif any(fname.endswith(s) for s in ESSENTIAL_SUFFIXES):
-                        tgt = f"{expert_dir}/{fname}"
                     else:
-                        continue
+                        tgt = f"{expert_dir}/{fname}"
                     plan.append((repo, fname, tgt, jitter))
             except Exception as e:
                 logger.error(f"Cannot access {repo}: {e}")
@@ -211,7 +172,7 @@ class DynamoEMerger:
         """Memory-efficient jitter"""
         size_gb = os.path.getsize(local_path) / (1024**3)
         if size_gb > JITTER_MAX_GB:
-            logger.warning(f"Skip jitter for {Path(local_path).name} ({size_gb:.1f}GB > {JITTER_MAX_GB}GB)")
+            logger.warning(f"Skip jitter for {Path(local_path).name} ({size_gb:.1f}GB)")
             return False
         
         try:
@@ -224,17 +185,14 @@ class DynamoEMerger:
                 if any(p in name.lower() for p in SAFE_SKIP_PATTERNS):
                     continue
                 
+                # Apply small perturbation
                 n = t.numel()
-                if n == 0:
-                    continue
-                
-                # Apply jitter to 2% of elements
                 k = max(1, int(n * JITTER_PCT))
                 indices = torch.randperm(n)[:k]
                 
-                # Small noise relative to tensor scale
+                # Scale noise to tensor magnitude
                 scale = float(t.abs().max().item()) if t.numel() > 0 else 1.0
-                noise = torch.randn(k) * scale * 0.001  # 0.1% of max value
+                noise = torch.randn(k) * scale * 0.001
                 
                 flat = t.view(-1)
                 flat[indices] += noise.to(t.dtype)
@@ -248,164 +206,126 @@ class DynamoEMerger:
             logger.error(f"Jitter failed: {e}")
             return False
 
-    def process_batch(self, batch, state):
-        """Upload batch of files"""
-        if not batch:
+    def run(self, models, batch_gb=DEFAULT_BATCH_MAX_GB):
+        """Main processing loop - NO GLOBAL LOCK"""
+        logger.info("Starting work (no global lock - claiming individual files)")
+        
+        state = self.read_state()
+        state.setdefault("files", {})
+        state.setdefault("weight_map", {})
+        state["source_models"] = [list(m.keys())[0] for m in models]
+        
+        plan = self.build_plan(models)
+        
+        # Claim files for this worker
+        claimed = self.claim_files(plan, state)
+        if not claimed:
+            logger.info("No files to claim - either all done or claimed by other workers")
             return
         
-        total_size = sum(b["size"] for b in batch)
-        ops = [CommitOperationAdd(path_in_repo=b["tgt"], path_or_fileobj=b["local"]) for b in batch]
+        logger.info(f"Claimed {len(claimed)} files for worker {self.worker_id}")
+        self.write_state(state, f"claimed {len(claimed)} for worker {self.worker_id}")
         
-        self.api.create_commit(
-            repo_id=self.target_repo,
-            operations=ops,
-            commit_message=f"batch {len(batch)} files ({total_size/(1024**3):.1f}GB) by {self.worker_id}",
-            repo_type="model"
-        )
+        bytes_limit = int(max(1.0, batch_gb) * (1024**3))
+        batch = []
+        batch_bytes = 0
         
-        for b in batch:
-            state["files"][b["tgt"]]["status"] = "done"
-            os.remove(b["local"])
-        
-        self.write_state(state, f"batch done by {self.worker_id}")
-        batch.clear()
-
-    def run(self, models, batch_gb=DEFAULT_BATCH_MAX_GB):
-        """Main processing loop"""
-        self.acquire_lock()
-        try:
-            state = self.read_state()
-            state.setdefault("files", {})
-            state.setdefault("weight_map", {})
-            
-            plan = self.build_plan(models)
-            
-            # Reconcile with existing files
-            try:
-                existing = set(self.api.list_repo_files(self.target_repo, repo_type="model"))
-                for _, _, tgt, jit in plan:
-                    if tgt in existing and state["files"].get(tgt, {}).get("status") != "done":
-                        state["files"][tgt] = {"status": "done", "jitter": jit}
-                        logger.info(f"Already exists: {tgt}")
-            except:
-                pass
-            
-            todo = [p for p in plan if state["files"].get(p[2], {}).get("status") != "done"]
-            logger.info(f"Files to process: {len(todo)}/{len(plan)}")
-            
-            if not todo:
-                logger.info("Nothing to do")
-                return
-            
-            batch = []
-            batch_size = 0
-            batch_limit = int(batch_gb * 1024**3)
-            
-            with tempfile.TemporaryDirectory() as tmpdir:
-                for repo, fname, tgt, jitter in todo:
-                    # Check disk space
-                    if get_disk_usage() < 2.0:
-                        logger.warning("Low disk space, cleaning up...")
-                        cleanup_temp()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for repo, fname, tgt, jitter in claimed:
+                logger.info(f"Processing {tgt} from {repo}/{fname}")
+                
+                if get_disk_usage() < 2.0:
+                    logger.warning("Low disk space, flushing batch")
+                    self.process_batch(batch, state)
+                    batch_bytes = 0
+                    cleanup_temp()
+                
+                try:
+                    local_path = hf_hub_download(
+                        repo_id=repo,
+                        filename=fname,
+                        repo_type="model",
+                        local_dir=tmpdir,
+                        resume_download=True
+                    )
+                    
+                    # Update weight map
+                    if tgt.endswith(".safetensors"):
+                        try:
+                            with safe_open(local_path, framework="pt") as f:
+                                for key in f.keys():
+                                    if key != "__metadata__":
+                                        state["weight_map"][key] = os.path.basename(tgt)
+                        except:
+                            pass
+                        
+                        # Apply jitter
+                        if jitter:
+                            self.safe_jitter(local_path)
+                    
+                    # Add to batch
+                    fsize = os.path.getsize(local_path)
+                    if fsize > bytes_limit:
+                        # Large file - upload immediately
                         if batch:
                             self.process_batch(batch, state)
-                            batch_size = 0
-                    
-                    logger.info(f"Processing {tgt} from {repo}/{fname}")
-                    
-                    state["files"].setdefault(tgt, {})["status"] = "pending"
-                    self.write_state(state, f"pending {tgt}")
-                    
-                    try:
-                        # Download with resume
-                        local_path = hf_hub_download(
-                            repo_id=repo,
-                            filename=fname,
-                            repo_type="model",
-                            local_dir=tmpdir,
-                            resume_download=True
-                        )
-                        
-                        # Update weight map for safetensors
-                        if tgt.endswith(".safetensors"):
-                            try:
-                                with safe_open(local_path, framework="pt") as f:
-                                    for key in f.keys():
-                                        if key != "__metadata__":
-                                            state["weight_map"][key] = os.path.basename(tgt)
-                            except:
-                                pass
-                            
-                            # Apply jitter if requested
-                            if jitter:
-                                self.safe_jitter(local_path)
-                        
-                        # Add to batch
-                        file_size = os.path.getsize(local_path)
-                        
-                        # Upload large files immediately
-                        if file_size > batch_limit:
-                            if batch:
-                                self.process_batch(batch, state)
-                                batch_size = 0
-                            self.process_batch([{"local": local_path, "tgt": tgt, "size": file_size}], state)
-                        else:
-                            # Check if batch would exceed limit
-                            if batch and (batch_size + file_size > batch_limit):
-                                self.process_batch(batch, state)
-                                batch_size = 0
-                            
-                            batch.append({"local": local_path, "tgt": tgt, "size": file_size})
-                            batch_size += file_size
-                    
-                    except Exception as e:
-                        logger.error(f"Failed processing {tgt}: {e}")
-                        state["files"][tgt]["status"] = "failed"
-                        self.write_state(state, f"failed {tgt}")
+                            batch_bytes = 0
+                        self.process_batch([{"local": local_path, "tgt": tgt, "size": fsize}], state)
+                    else:
+                        if batch and (batch_bytes + fsize > bytes_limit):
+                            self.process_batch(batch, state)
+                            batch_bytes = 0
+                        batch.append({"local": local_path, "tgt": tgt, "size": fsize})
+                        batch_bytes += fsize
                 
-                # Final batch
-                if batch:
-                    self.process_batch(batch, state)
+                except Exception as e:
+                    logger.error(f"Failed processing {tgt}: {e}")
+                    state["files"][tgt]["status"] = "failed"
+                    self.write_state(state, f"failed {tgt}")
             
-            # Create index
-            logger.info("Creating index...")
-            with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json') as tmp:
-                json.dump({"metadata": {}, "weight_map": state.get("weight_map", {})}, tmp)
-                idx_path = tmp.name
-            
-            try:
-                self.api.upload_file(
-                    idx_path,
-                    "model.safetensors.index.json",
-                    self.target_repo,
-                    repo_type="model",
-                    commit_message="index"
-                )
-            finally:
-                os.remove(idx_path)
-            
-            logger.info("Merge complete")
+            # Final batch
+            if batch:
+                self.process_batch(batch, state)
         
+        # Create index
+        logger.info("Creating final index...")
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json') as tmp:
+            json.dump({"metadata": {}, "weight_map": state.get("weight_map", {})}, tmp)
+            idx_path = tmp.name
+        
+        try:
+            self.api.upload_file(
+                idx_path,
+                "model.safetensors.index.json",
+                self.target_repo,
+                repo_type="model",
+                commit_message="Final index"
+            )
         finally:
-            self.release_lock()
+            os.remove(idx_path)
+        
+        logger.info(f"Worker {self.worker_id} finished")
 
 # ============ CLI ============
 def main():
-    parser = argparse.ArgumentParser(description="DynamoE Model Merger")
+    parser = argparse.ArgumentParser(description="DynamoE Model Merger (Parallel Workers)")
     parser.add_argument("--target", required=True, help="Target repo (user/repo)")
     parser.add_argument("--token", required=True, help="HuggingFace token")
     parser.add_argument("--models", required=True, help="JSON list of models")
+    parser.add_argument("--worker-id", type=int, default=1, help="Worker ID (1-based)")
+    parser.add_argument("--total-workers", type=int, default=1, help="Total number of workers")
     parser.add_argument("--batch-gb", type=float, default=DEFAULT_BATCH_MAX_GB, help="Batch size in GB")
     parser.add_argument("--verbose", action="store_true", help="Verbose logging")
     
     args = parser.parse_args()
     
-    global logger
-    logger = setup_logging(args.verbose)
+    if args.verbose:
+        global logger
+        logger = setup_logging(verbose=True)
     
     try:
         models = json.loads(args.models)
-        merger = DynamoEMerger(args.target, args.token)
+        merger = DynamoEMerger(args.target, args.token, args.worker_id, args.total_workers)
         merger.run(models, args.batch_gb)
     except Exception as e:
         logger.error(f"Fatal error: {e}")
