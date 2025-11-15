@@ -6,20 +6,21 @@ on:
       target_repo:
         description: 'Target repository (user/repo)'
         required: true
-        default: 'deca-ai/3-ultra-2510'
+        default: 'deca-ai/3-ultra-2511'
       models_json:
         description: 'Models JSON (paste entire list)'
         required: true
         default: |
           [
-            {"Qwen/Qwen3-VL-235B-A22B-Instruct": true},
-            {"Qwen/Qwen3-VL-235B-A22B-Thinking": true},
-            {"deepseek-ai/DeepSeek-V3.1-Terminus": true},
-            {"moonshotai/Kimi-K2-Instruct-0905": true},
-            {"Qwen/Qwen3-Coder-480B-A35B-Instruct": true},
-            {"meituan-longcat/LongCat-Flash-Chat": true},
-            {"zai-org/GLM-4.5": true},
-            {"inclusionAI/Ring-1T-preview": true}
+              {"Qwen/Qwen3-VL-235B-A22B-Instruct": true},
+              {"Qwen/Qwen3-VL-235B-A22B-Thinking": true},
+              {"deepseek-ai/DeepSeek-V3.2-Exp": true},
+              {"moonshotai/Kimi-K2-Instruct-0905": true},
+              {"Qwen/Qwen3-Coder-480B-A35B-Instruct": true},
+              {"meituan-longcat/LongCat-Flash-Chat": true},
+              {"zai-org/GLM-4.6": true},
+              {"moonshotai/Kimi-K2-Thinking": true},
+              {"MiniMaxAI/MiniMax-M2": true}
           ]
       worker_count:
         description: 'Number of parallel workers'
