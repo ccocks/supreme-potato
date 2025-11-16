@@ -63,7 +63,7 @@ jobs:
     - name: Install dependencies
       run: |
         pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
-        pip install --no-cache-dir safetensors huggingface_hub
+        pip install --no-cache-dir safetensors huggingface_hub numpy torch
         df -h
     
     - name: Skip if worker exceeds count
