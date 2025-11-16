@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-DynamoE Merger - ONE-FILE-IN, ONE-FILE-OUT VERSION
-Extremely disk-frugal for GitHub Actions. No batching.
+DynamoE Merger - with DYNAMIC BATCHING and STREAMING JITTER.
+Automatically adjusts batch size based on available disk space.
 """
 
 import os
@@ -18,26 +18,27 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from functools import wraps
 
-# Minimal imports
+# Minimal imports - numpy is now required for this method
 try:
     import torch
+    import numpy as np
     from safetensors import safe_open
     from safetensors.torch import load_file, save_file
     from huggingface_hub import HfApi, hf_hub_download, CommitOperationAdd
     from huggingface_hub.utils import HfHubHTTPError
 except ImportError as e:
     print(f"Missing dependency: {e}", file=sys.stderr)
-    print("Install with: pip install torch safetensors huggingface_hub", file=sys.stderr)
+    print("Install with: pip install torch safetensors huggingface_hub numpy", file=sys.stderr)
     sys.exit(1)
 
 # ============ CONFIG ============
 STATE_FILE = "dynamoe_merger.state.json"
 LOG_FILE = "dynamoe_merger.log"
 MAX_RETRIES = 5
-BACKOFF_BASE_SEC = 10 # Increased backoff for more frequent commits
+BACKOFF_BASE_SEC = 10
 
 JITTER_PCT = 0.02
-JITTER_MAX_GB = 2.0  # Skip jitter on files >2GB on Actions
+JITTER_MAX_GB = 4.0  # Increased slightly due to streaming
 CHUNK_ELEMS = 1_000_000
 
 SAFE_SKIP_PATTERNS = (
@@ -46,6 +47,15 @@ SAFE_SKIP_PATTERNS = (
     "inv_freq", "alibi", "position", "router", "route", "gate", "gating",
     "expert_score", "topk", "switch", "dispatch", "bias"
 )
+
+# Map safetensors dtype strings to numpy dtypes
+DTYPE_MAP = {
+    "F16": np.float16, "BF16": np.float16,
+    "F32": np.float32, "F64": np.float64,
+    "I8": np.int8, "I16": np.int16, "I32": np.int32, "I64": np.int64,
+    "U8": np.uint8, "U16": np.uint16, "U32": np.uint32, "U64": np.uint64,
+    "BOOL": np.bool_,
+}
 
 # ============ LOGGING ============
 def setup_logging(verbose=False):
@@ -61,9 +71,13 @@ def setup_logging(verbose=False):
 logger = setup_logging()
 
 # ============ UTILITIES ============
-def get_disk_usage():
-    stat = shutil.disk_usage("/")
-    return stat.free / (1024**3)
+def get_disk_usage_gb():
+    try:
+        stat = shutil.disk_usage("/")
+        return stat.free / (1024**3)
+    except Exception as e:
+        logger.warning(f"Could not get disk usage: {e}")
+        return 2.0 # Assume a very low safe value
 
 def backoff(fn):
     @wraps(fn)
@@ -88,7 +102,6 @@ class DynamoEMerger:
         self.total_workers = int(total_workers)
         self.api.create_repo(repo_id=self.target_repo, exist_ok=True, repo_type="model")
         logger.info(f"Initialized worker {self.worker_id}/{self.total_workers} for {self.target_repo}")
-        logger.info(f"Available disk: {get_disk_usage():.1f}GB")
 
     @backoff
     def read_state(self):
@@ -146,41 +159,106 @@ class DynamoEMerger:
                 plan.append((repo, fname, tgt, jitter))
         return plan
 
-    def safe_jitter(self, local_path):
-        size_gb = os.path.getsize(local_path) / (1024**3)
-        if size_gb > JITTER_MAX_GB:
-            logger.warning(f"Skip jitter for {Path(local_path).name} ({size_gb:.1f}GB)")
+    def _should_jitter_param(self, name: str, tensor_info: dict) -> bool:
+        dtype_str = tensor_info.get("dtype", "")
+        if "F" not in dtype_str:
             return False
-        try:
-            tensors = load_file(local_path)
-            changed = False
-            for name, t in tensors.items():
-                if not t.dtype.is_floating_point or t.ndim < 2: continue
-                if any(p in name.lower() for p in SAFE_SKIP_PATTERNS): continue
-                n = t.numel()
-                k = max(1, int(n * JITTER_PCT))
-                indices = torch.randperm(n)[:k]
-                scale = float(t.abs().max().item()) if n > 0 else 1.0
-                noise = torch.randn(k) * scale * 0.001
-                t.view(-1)[indices] += noise.to(t.dtype)
-                changed = True
-            if changed:
-                save_file(tensors, local_path)
-                logger.info(f"Jitter applied to {Path(local_path).name}")
-            return changed
-        except Exception as e:
-            logger.error(f"Jitter failed: {e}")
+        if len(tensor_info.get("shape", [])) < 2:
+            return False
+        lname = name.lower()
+        if any(p in lname for p in SAFE_SKIP_PATTERNS):
+            logger.debug(f"Skipping jitter for protected tensor: {name}")
+            return False
+        return True
+
+    def stream_jitter(self, local_path: str):
+        file_size_gb = os.path.getsize(local_path) / (1024**3)
+        if file_size_gb > JITTER_MAX_GB:
+            logger.warning(f"SKIPPED JITTER: {Path(local_path).name} is {file_size_gb:.1f}GB > {JITTER_MAX_GB}GB limit.")
+            return False
+        if get_disk_usage_gb() < file_size_gb * 1.1:
+            logger.warning(f"SKIPPED JITTER: Not enough disk for temp copy of {Path(local_path).name}.")
             return False
 
-    def run(self, models):
-        logger.info("Starting work in one-file-in, one-file-out mode...")
+        logger.info(f"Applying streaming jitter to {Path(local_path).name} (one tensor at a time)...")
+        temp_jitter_path = local_path + ".jittering"
+        shutil.copy2(local_path, temp_jitter_path)
+        
+        try:
+            with safe_open(local_path, framework="pt", device="cpu") as f_read:
+                metadata = f_read.metadata()
+                if not metadata: raise ValueError("Could not read safetensors metadata.")
+            
+            changed_tensors = 0
+            with open(temp_jitter_path, "r+b") as f_write:
+                for name, tensor_info in metadata.items():
+                    if name == "__metadata__" or not self._should_jitter_param(name, tensor_info):
+                        continue
+
+                    shape, dtype_str, (start, end) = tensor_info['shape'], tensor_info['dtype'], tensor_info['data_offsets']
+                    f_write.seek(start)
+                    tensor_bytes = f_write.read(end - start)
+                    
+                    np_dtype = DTYPE_MAP.get(dtype_str)
+                    if not np_dtype: continue
+                    
+                    tensor = torch.from_numpy(np.frombuffer(tensor_bytes, dtype=np_dtype).copy()).view(shape)
+                    
+                    n = tensor.numel()
+                    if n == 0: continue
+                    k = max(1, int(n * JITTER_PCT))
+                    
+                    t_float = tensor.float()
+                    indices = torch.randperm(n)[:k]
+                    scale = float(t_float.abs().max().item()) if n > 0 else 1.0
+                    noise = torch.randn(k) * scale * 0.001
+                    
+                    t_float.view(-1)[indices] += noise
+                    
+                    modified_tensor = t_float.to(tensor.dtype)
+                    f_write.seek(start)
+                    f_write.write(modified_tensor.numpy().tobytes())
+                    changed_tensors += 1
+                    logger.debug(f"Jittered tensor: {name}")
+
+            if changed_tensors > 0:
+                os.replace(temp_jitter_path, local_path)
+                logger.info(f"Streaming jitter complete. {changed_tensors} tensors modified.")
+                return True
+            else:
+                logger.info(f"No eligible tensors for jitter found.")
+                os.remove(temp_jitter_path)
+                return False
+        except Exception as e:
+            logger.error(f"Streaming jitter failed: {e}", exc_info=True)
+            if os.path.exists(temp_jitter_path): os.remove(temp_jitter_path)
+            return False
+
+    @backoff
+    def _commit_batch(self, batch_items, state):
+        if not batch_items: return
+        total_size = sum(b["size"] for b in batch_items)
+        ops = [CommitOperationAdd(path_in_repo=b["tgt"], path_or_fileobj=b["local"]) for b in batch_items]
+        
+        self.api.create_commit(repo_id=self.target_repo, operations=ops, commit_message=f"batch: {len(ops)} files by worker {self.worker_id}")
+        
+        for b in batch_items:
+            state["files"][b["tgt"]]["status"] = "done"
+        self.write_state(state, f"batch done by worker {self.worker_id}")
+        
+        for b in batch_items:
+            os.remove(b["local"])
+        batch_items.clear()
+        logger.info(f"Committed batch of {len(ops)} files ({total_size/(1024**3):.1f} GB).")
+
+    def run(self, models, disk_fraction=0.5):
+        logger.info("Starting work with DYNAMIC BATCHING...")
         state = self.read_state()
         state.setdefault("files", {})
         state.setdefault("weight_map", {})
         
         plan = self.build_plan(models)
         
-        # Reconcile with existing remote files
         try:
             remote_files = set(self.api.list_repo_files(self.target_repo, repo_type="model"))
             for _, _, tgt, _ in plan:
@@ -198,54 +276,69 @@ class DynamoEMerger:
         logger.info(f"Worker {self.worker_id} will process {len(my_files)} files.")
         
         with tempfile.TemporaryDirectory() as tmpdir:
+            free_space_gb = get_disk_usage_gb()
+            bytes_limit = int(free_space_gb * disk_fraction * (1024**3))
+            logger.info(f"Available disk: {free_space_gb:.1f}GB. Dynamic batch limit set to {bytes_limit/(1024**3):.1f}GB.")
+            
+            batch, batch_bytes = [], 0
+            
             for repo, fname, tgt, jitter in my_files:
-                local_path = None
                 try:
-                    logger.info(f"Processing {tgt}...")
+                    logger.info(f"Preparing {tgt}...")
                     
-                    if get_disk_usage() < 2.0: # Safety check
-                        logger.error("Critically low disk space (<2GB). Aborting to prevent crash.")
-                        break
-
                     local_path = hf_hub_download(repo_id=repo, filename=fname, local_dir=tmpdir, resume_download=True)
+                    fsize = os.path.getsize(local_path)
                     
-                    if tgt.endswith(".safetensors"):
-                        with safe_open(local_path, framework="pt") as f:
-                            for key in f.keys():
-                                if key != "__metadata__":
-                                    state["weight_map"][key] = os.path.basename(tgt)
-                        if jitter:
-                            self.safe_jitter(local_path)
+                    # If this single file is too big, process and commit it alone
+                    if fsize > bytes_limit:
+                        if batch: self._commit_batch(batch, state)
+                        self.process_and_upload_single(local_path, tgt, jitter, state)
+                        continue
                     
-                    # Upload this single file immediately
-                    self.api.upload_file(path_or_fileobj=local_path, path_in_repo=tgt, repo_id=self.target_repo, repo_type="model", commit_message=f"add: {tgt} by worker {self.worker_id}")
+                    # If adding this file exceeds the batch limit, commit the current batch first
+                    if batch and (batch_bytes + fsize > bytes_limit):
+                        self._commit_batch(batch, state)
+                        batch_bytes = 0
                     
-                    # Mark as done and persist state
-                    state["files"][tgt] = {"status": "done"}
-                    self.write_state(state, f"done: {tgt}")
-
+                    # Process and add to batch
+                    self.process_file(local_path, tgt, jitter, state)
+                    batch.append({"local": local_path, "tgt": tgt, "size": fsize})
+                    batch_bytes += fsize
+                
                 except Exception as e:
                     logger.error(f"Failed processing {tgt}: {e}")
                     state["files"][tgt] = {"status": "failed"}
                     self.write_state(state, f"failed: {tgt}")
-                finally:
-                    # Delete local file immediately
-                    if local_path and os.path.exists(local_path):
-                        os.remove(local_path)
+            
+            if batch:
+                self._commit_batch(batch, state)
         
         if self.worker_id == 1:
             self.finalize_if_complete(plan, state)
             
         logger.info(f"Worker {self.worker_id} finished.")
 
-    def finalize_if_complete(self, plan, state):
-        all_done = all(state.get("files", {}).get(p[2], {}).get("status") == "done" for p in plan)
-        if not all_done or not plan:
-            return
+    def process_file(self, local_path, tgt, jitter, state):
+        if tgt.endswith(".safetensors"):
+            with safe_open(local_path, framework="pt") as f:
+                for key in f.keys():
+                    if key != "__metadata__":
+                        state["weight_map"][key] = os.path.basename(tgt)
+            if jitter:
+                self.stream_jitter(local_path)
+    
+    def process_and_upload_single(self, local_path, tgt, jitter, state):
+        self.process_file(local_path, tgt, jitter, state)
+        self._commit_batch([{"local": local_path, "tgt": tgt, "size": os.path.getsize(local_path)}], state)
 
-        logger.info("All files are processed. Finalizing index...")
+    def finalize_if_complete(self, plan, state):
+        if not plan: return
+        all_done = all(state.get("files", {}).get(p[2], {}).get("status") == "done" for p in plan)
+        if not all_done: return
+
+        logger.info("All files processed. Finalizing index...")
         with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json') as tmp:
-            json.dump({"metadata": {}, "weight_map": state.get("weight_map", {})}, tmp)
+            json.dump({"metadata": {}, "weight_map": state.get("weight_map", {})}, tmp, indent=2)
             idx_path = tmp.name
         try:
             self.api.upload_file(path_or_fileobj=idx_path, path_in_repo="model.safetensors.index.json", repo_id=self.target_repo, repo_type="model", commit_message="Final index")
@@ -255,12 +348,13 @@ class DynamoEMerger:
 
 # ============ CLI ============
 def main():
-    parser = argparse.ArgumentParser(description="DynamoE Model Merger (Disk-Frugal)")
+    parser = argparse.ArgumentParser(description="DynamoE Merger (Dynamic Batching)")
     parser.add_argument("--target", required=True)
     parser.add_argument("--token", required=True)
     parser.add_argument("--models", required=True)
     parser.add_argument("--worker-id", type=int, default=1)
     parser.add_argument("--total-workers", type=int, default=1)
+    parser.add_argument("--disk-fraction", type=float, default=0.5, help="Fraction of free disk to use for batching (0.1 to 0.8)")
     parser.add_argument("--verbose", action="store_true")
     
     args = parser.parse_args()
@@ -271,7 +365,7 @@ def main():
     try:
         models = json.loads(args.models)
         merger = DynamoEMerger(args.target, args.token, args.worker_id, args.total_workers)
-        merger.run(models)
+        merger.run(models, disk_fraction=args.disk_fraction)
     except Exception as e:
         logger.error(f"Fatal error: {e}", exc_info=args.verbose)
         sys.exit(1)
