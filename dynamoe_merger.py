@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 DynamoE Merger - with DYNAMIC BATCHING and STREAMING JITTER.
-Automatically adjusts batch size based on available disk space.
+Fixes AttributeError in stream_jitter and prevents empty commits.
 """
 
 import os
@@ -38,7 +38,7 @@ MAX_RETRIES = 5
 BACKOFF_BASE_SEC = 10
 
 JITTER_PCT = 0.02
-JITTER_MAX_GB = 4.0  # Increased slightly due to streaming
+JITTER_MAX_GB = 4.0
 CHUNK_ELEMS = 1_000_000
 
 SAFE_SKIP_PATTERNS = (
@@ -48,10 +48,8 @@ SAFE_SKIP_PATTERNS = (
     "expert_score", "topk", "switch", "dispatch", "bias"
 )
 
-# Map safetensors dtype strings to numpy dtypes
 DTYPE_MAP = {
-    "F16": np.float16, "BF16": np.float16,
-    "F32": np.float32, "F64": np.float64,
+    "F16": np.float16, "BF16": np.float16, "F32": np.float32, "F64": np.float64,
     "I8": np.int8, "I16": np.int16, "I32": np.int32, "I64": np.int64,
     "U8": np.uint8, "U16": np.uint16, "U32": np.uint32, "U64": np.uint64,
     "BOOL": np.bool_,
@@ -75,9 +73,8 @@ def get_disk_usage_gb():
     try:
         stat = shutil.disk_usage("/")
         return stat.free / (1024**3)
-    except Exception as e:
-        logger.warning(f"Could not get disk usage: {e}")
-        return 2.0 # Assume a very low safe value
+    except Exception:
+        return 2.0
 
 def backoff(fn):
     @wraps(fn)
@@ -131,9 +128,7 @@ class DynamoEMerger:
         return my_files
 
     def build_plan(self, models):
-        plan = []
-        total_shards = 0
-        repo_files_map = {}
+        plan, total_shards, repo_files_map = [], 0, {}
         for model_config in models:
             repo = list(model_config.keys())[0]
             try:
@@ -145,11 +140,10 @@ class DynamoEMerger:
         
         shard_idx = 1
         for expert_idx, model_config in enumerate(models):
-            repo = list(model_config.keys())[0]
-            jitter = list(model_config.values())[0]
+            repo, jitter = list(model_config.items())[0]
             expert_dir = f"experts/expert_{expert_idx:03d}"
             for fname in repo_files_map.get(repo, []):
-                if fname.endswith(".metal") or fname.startswith("."):
+                if fname.endswith((".metal",)) or fname.startswith("."):
                     continue
                 if fname.endswith(".safetensors"):
                     tgt = f"model-{shard_idx:05d}-of-{total_shards:05d}.safetensors"
@@ -191,6 +185,7 @@ class DynamoEMerger:
             
             changed_tensors = 0
             with open(temp_jitter_path, "r+b") as f_write:
+                # FIX: Iterate through metadata.items() correctly
                 for name, tensor_info in metadata.items():
                     if name == "__metadata__" or not self._should_jitter_param(name, tensor_info):
                         continue
@@ -229,6 +224,7 @@ class DynamoEMerger:
                 logger.info(f"No eligible tensors for jitter found.")
                 os.remove(temp_jitter_path)
                 return False
+                
         except Exception as e:
             logger.error(f"Streaming jitter failed: {e}", exc_info=True)
             if os.path.exists(temp_jitter_path): os.remove(temp_jitter_path)
@@ -240,6 +236,11 @@ class DynamoEMerger:
         total_size = sum(b["size"] for b in batch_items)
         ops = [CommitOperationAdd(path_in_repo=b["tgt"], path_or_fileobj=b["local"]) for b in batch_items]
         
+        # FIX: Check for empty operations before committing
+        if not ops:
+            logger.warning("Attempted to commit an empty batch. Skipping.")
+            return
+
         self.api.create_commit(repo_id=self.target_repo, operations=ops, commit_message=f"batch: {len(ops)} files by worker {self.worker_id}")
         
         for b in batch_items:
@@ -254,8 +255,7 @@ class DynamoEMerger:
     def run(self, models, disk_fraction=0.5):
         logger.info("Starting work with DYNAMIC BATCHING...")
         state = self.read_state()
-        state.setdefault("files", {})
-        state.setdefault("weight_map", {})
+        state.setdefault("files", {}); state.setdefault("weight_map", {})
         
         plan = self.build_plan(models)
         
@@ -289,19 +289,17 @@ class DynamoEMerger:
                     local_path = hf_hub_download(repo_id=repo, filename=fname, local_dir=tmpdir, resume_download=True)
                     fsize = os.path.getsize(local_path)
                     
-                    # If this single file is too big, process and commit it alone
+                    self.process_file(local_path, tgt, jitter, state)
+
                     if fsize > bytes_limit:
-                        if batch: self._commit_batch(batch, state)
-                        self.process_and_upload_single(local_path, tgt, jitter, state)
+                        if batch: self._commit_batch(batch, state); batch_bytes=0
+                        self.process_and_upload_single(local_path, tgt, state)
                         continue
                     
-                    # If adding this file exceeds the batch limit, commit the current batch first
                     if batch and (batch_bytes + fsize > bytes_limit):
                         self._commit_batch(batch, state)
                         batch_bytes = 0
                     
-                    # Process and add to batch
-                    self.process_file(local_path, tgt, jitter, state)
                     batch.append({"local": local_path, "tgt": tgt, "size": fsize})
                     batch_bytes += fsize
                 
@@ -327,8 +325,7 @@ class DynamoEMerger:
             if jitter:
                 self.stream_jitter(local_path)
     
-    def process_and_upload_single(self, local_path, tgt, jitter, state):
-        self.process_file(local_path, tgt, jitter, state)
+    def process_and_upload_single(self, local_path, tgt, state):
         self._commit_batch([{"local": local_path, "tgt": tgt, "size": os.path.getsize(local_path)}], state)
 
     def finalize_if_complete(self, plan, state):
@@ -354,7 +351,7 @@ def main():
     parser.add_argument("--models", required=True)
     parser.add_argument("--worker-id", type=int, default=1)
     parser.add_argument("--total-workers", type=int, default=1)
-    parser.add_argument("--disk-fraction", type=float, default=0.5, help="Fraction of free disk to use for batching (0.1 to 0.8)")
+    parser.add_argument("--disk-fraction", type=float, default=0.5)
     parser.add_argument("--verbose", action="store_true")
     
     args = parser.parse_args()
