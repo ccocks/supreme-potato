@@ -91,6 +91,7 @@ jobs:
           --target "${{ github.event.inputs.target_repo }}" \
           --token "$HF_TOKEN" \
           --models '${{ github.event.inputs.models_json }}' \
+          --disk-fraction 0.7 \
           --verbose
       timeout-minutes: 360
     
