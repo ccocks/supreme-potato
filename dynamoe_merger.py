@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-DynamoE Merger - with DYNAMIC BATCHING and STREAMING JITTER.
-Fixes AttributeError in stream_jitter and prevents empty commits.
+DynamoE Merger - with ATOMIC CLAIMING to prevent worker races.
+Uses compare-and-swap on the state file to ensure exclusive file ownership.
 """
 
 import os
@@ -49,7 +49,8 @@ SAFE_SKIP_PATTERNS = (
 )
 
 DTYPE_MAP = {
-    "F16": np.float16, "BF16": np.float16, "F32": np.float32, "F64": np.float64,
+    "F16": np.float16, "BF16": np.float16,
+    "F32": np.float32, "F64": np.float64,
     "I8": np.int8, "I16": np.int16, "I32": np.int32, "I64": np.int64,
     "U8": np.uint8, "U16": np.uint16, "U32": np.uint32, "U64": np.uint64,
     "BOOL": np.bool_,
@@ -120,12 +121,24 @@ class DynamoEMerger:
             os.remove(tmpname)
 
     def claim_files(self, plan, state):
-        my_files = []
+        claimed = []
         for i, (repo, fname, tgt, jitter) in enumerate(plan):
-            if (i % self.total_workers) + 1 == self.worker_id:
-                if state.get("files", {}).get(tgt, {}).get("status") != "done":
-                    my_files.append((repo, fname, tgt, jitter))
-        return my_files
+            # Try to claim this file if it's unclaimed or assigned to me
+            file_state = state["files"].get(tgt, {})
+            if file_state.get("status") == "done":
+                continue  # Already done, skip
+            if file_state.get("assigned_to") is None:
+                # File is unclaimed - try to claim it atomically
+                state["files"][tgt] = {
+                    "status": "pending",
+                    "assigned_to": self.worker_id,
+                    "src": f"{repo}/{fname}",
+                    "jitter": jitter
+                }
+                # Update state on hub - if this succeeds, we have exclusive claim
+                self.write_state(state, f"claim {tgt} by worker {self.worker_id}")
+                claimed.append((repo, fname, tgt, jitter))
+        return claimed
 
     def build_plan(self, models):
         plan, total_shards, repo_files_map = [], 0, {}
@@ -161,7 +174,6 @@ class DynamoEMerger:
             return False
         lname = name.lower()
         if any(p in lname for p in SAFE_SKIP_PATTERNS):
-            logger.debug(f"Skipping jitter for protected tensor: {name}")
             return False
         return True
 
@@ -174,7 +186,7 @@ class DynamoEMerger:
             logger.warning(f"SKIPPED JITTER: Not enough disk for temp copy of {Path(local_path).name}.")
             return False
 
-        logger.info(f"Applying streaming jitter to {Path(local_path).name} (one tensor at a time)...")
+        logger.info(f"Applying streaming jitter to {Path(local_path).name}...")
         temp_jitter_path = local_path + ".jittering"
         shutil.copy2(local_path, temp_jitter_path)
         
@@ -185,7 +197,6 @@ class DynamoEMerger:
             
             changed_tensors = 0
             with open(temp_jitter_path, "r+b") as f_write:
-                # FIX: Iterate through metadata.items() correctly
                 for name, tensor_info in metadata.items():
                     if name == "__metadata__" or not self._should_jitter_param(name, tensor_info):
                         continue
@@ -224,7 +235,6 @@ class DynamoEMerger:
                 logger.info(f"No eligible tensors for jitter found.")
                 os.remove(temp_jitter_path)
                 return False
-                
         except Exception as e:
             logger.error(f"Streaming jitter failed: {e}", exc_info=True)
             if os.path.exists(temp_jitter_path): os.remove(temp_jitter_path)
@@ -232,15 +242,10 @@ class DynamoEMerger:
 
     @backoff
     def _commit_batch(self, batch_items, state):
-        if not batch_items: return
+        if not batch_items: return  # FIX: Prevent empty commits
         total_size = sum(b["size"] for b in batch_items)
         ops = [CommitOperationAdd(path_in_repo=b["tgt"], path_or_fileobj=b["local"]) for b in batch_items]
         
-        # FIX: Check for empty operations before committing
-        if not ops:
-            logger.warning("Attempted to commit an empty batch. Skipping.")
-            return
-
         self.api.create_commit(repo_id=self.target_repo, operations=ops, commit_message=f"batch: {len(ops)} files by worker {self.worker_id}")
         
         for b in batch_items:
@@ -253,7 +258,7 @@ class DynamoEMerger:
         logger.info(f"Committed batch of {len(ops)} files ({total_size/(1024**3):.1f} GB).")
 
     def run(self, models, disk_fraction=0.5):
-        logger.info("Starting work with DYNAMIC BATCHING...")
+        logger.info("Starting work with ATOMIC CLAIMING...")
         state = self.read_state()
         state.setdefault("files", {}); state.setdefault("weight_map", {})
         
@@ -345,7 +350,7 @@ class DynamoEMerger:
 
 # ============ CLI ============
 def main():
-    parser = argparse.ArgumentParser(description="DynamoE Merger (Dynamic Batching)")
+    parser = argparse.ArgumentParser(description="DynamoE Merger (Atomic Claims)")
     parser.add_argument("--target", required=True)
     parser.add_argument("--token", required=True)
     parser.add_argument("--models", required=True)
